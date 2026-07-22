@@ -140,7 +140,7 @@ class Config:
     last_fingerprint_file: str = "last_fingerprint.txt"
     heartbeat_file: str = "heartbeat.txt"
     heartbeat_interval_seconds: int = 24 * 60 * 60
-    run_forever: bool = False
+    run_forever: bool = True
 
 
 def cutoff_date(cfg: Config) -> date:
@@ -331,11 +331,11 @@ async def main_async() -> None:
         ).strip()
         or cfg.heartbeat_interval_seconds
     )
-    cfg.run_forever = os.getenv("FRONTDESK_RUN_FOREVER", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-    }
+    run_forever_env = os.getenv("FRONTDESK_RUN_FOREVER", "").strip().lower()
+    if run_forever_env:
+        cfg.run_forever = run_forever_env in {"1", "true", "yes"}
+    else:
+        cfg.run_forever = True
 
     # Prefer a state directory if provided by the runtime/container.
     # Check ENV, then conventional mount path, then fallback to current working dir.

@@ -37,6 +37,7 @@ jobs:
           FRONTDESK_WITNESS_CHOICE: ${{ vars.FRONTDESK_WITNESS_CHOICE || 'no' }}
           FRONTDESK_AUTO_CLICK_FIRST_SLOT: ${{ vars.FRONTDESK_AUTO_CLICK_FIRST_SLOT || 'false' }}
           FRONTDESK_HEARTBEAT_INTERVAL_SECONDS: ${{ vars.FRONTDESK_HEARTBEAT_INTERVAL_SECONDS || '86400' }}
+          FRONTDESK_RUN_FOREVER: "false"
           FRONTDESK_STATE_DIR: ${{ github.workspace }}/state
         run: |
           python frontdesk_watch.py

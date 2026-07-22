@@ -3,6 +3,7 @@ from datetime import datetime
 from pathlib import Path
 
 from frontdesk_watch import (
+    Config,
     build_heartbeat_message,
     build_telegram_message,
     load_dotenv,
@@ -68,6 +69,12 @@ def test_build_heartbeat_message_is_clear() -> None:
     assert "Frontdesk watcher heartbeat" in message
     assert "https://example.test" in message
     assert "24 hours" in message
+
+
+def test_config_defaults_to_continuous_local_watching() -> None:
+    cfg = Config()
+
+    assert cfg.run_forever is True
 
 
 def test_heartbeat_helpers_persist_and_trigger(tmp_path: Path) -> None:
