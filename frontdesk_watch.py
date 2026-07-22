@@ -1,24 +1,63 @@
 import asyncio
+import hashlib
 import json
 import os
-import requests
 import random
 import re
-from dataclasses import dataclass
-from datetime import datetime, date
-from typing import List, Set
-import hashlib
 import time
+from dataclasses import dataclass
+from datetime import date, datetime
+from pathlib import Path
+from typing import List, Set
 
+import requests
 from bs4 import BeautifulSoup
 from dateutil import parser as dtparser
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import (
+    async_playwright,
+    TimeoutError as PlaywrightTimeoutError,
+)
+
+
+def load_dotenv(path: str | None = None) -> None:
+    """Load environment variables from .env if they are not already set."""
+    candidates = []
+    if path:
+        candidates.append(Path(path))
+    candidates.extend(
+        [
+            Path(__file__).resolve().parent / ".env",
+            Path.cwd() / ".env",
+        ]
+    )
+
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        for raw_line in candidate.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export ") :].strip()
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            os.environ.setdefault(key, value)
+        if os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_CHAT_ID"):
+            break
+
+
+load_dotenv()
+
 
 def telegram_send(message: str) -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     if not token or not chat_id:
-        return  # silently do nothing if not configured
+        return
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
@@ -31,38 +70,57 @@ def telegram_send(message: str) -> None:
     except Exception:
         pass
 
+
 def slots_fingerprint(slots: List[datetime]) -> str:
-    """
-    Stable fingerprint of the current availability list.
-    """
+    """Stable fingerprint of the current availability list."""
     payload = "|".join(s.isoformat(timespec="minutes") for s in slots)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def build_telegram_message(slots: List[datetime], home_url: str) -> str:
+    """Create a concise Telegram alert for current availability."""
+    if not slots:
+        return ""
+
+    first_slot = slots[0]
+    first_slot_text = first_slot.strftime("%a %d %b %Y at %H:%M")
+    if len(slots) == 1:
+        detail = f"First free slot: {first_slot_text}"
+    else:
+        detail = f"{len(slots)} free slots visible. First: {first_slot_text}"
+
+    return "\n".join(
+        [
+            "Frontdesk booking alert",
+            detail,
+            f"Open: {home_url}",
+        ]
+    )
 
 
 @dataclass
 class Config:
     home_url: str = (
-        "https://reservation.frontdesksuite.com/kkvielse/raadhuset/Home/Index"
-        "?pageId=6bffdce0-29ab-4353-bdce-9392b1298063&culture=en&uiCulture=en"
+        "https://reservation.frontdesksuite.com/toender/vielse/Home/Index"
+        "?pageid=8d47364a-5e21-4e40-892d-e9f46878e18b&culture=en&uiculture=en"
     )
+    witness_choice: str = "no"
 
-    # The exact link text codegen found (we'll match as a prefix to be safe)
-    go_to_time_selection_link_prefix: str = "Select date and time for the"
+    interval_seconds: int = 20
+    jitter_seconds: int = 5
 
-    interval_seconds: int = 30
-    jitter_seconds: int = 10
-
-    cutoff_year: int = 2026
-    cutoff_month: int = 6
-    cutoff_day: int = 1  # before June 1
+    cutoff_year: int = 2099
+    cutoff_month: int = 1
+    cutoff_day: int = 1
 
     seen_file: str = "seen_slots.json"
     headless: bool = True
 
-    # Telegram rate limiting / change detection
-    telegram_min_interval_seconds: int = 30 * 60   # 30 minutes
-    telegram_max_items: int = 10                   # cap message length
-
+    telegram_min_interval_seconds: int = 30 * 60
+    telegram_max_items: int = 10
+    auto_click_first_slot: bool = False
+    telegram_remind_if_still_available: bool = False
+    last_fingerprint_file: str = "last_fingerprint.txt"
 
 
 def cutoff_date(cfg: Config) -> date:
@@ -85,12 +143,31 @@ def save_seen(path: str, seen: Set[str]) -> None:
         json.dump(sorted(seen), f, ensure_ascii=False, indent=2)
 
 
+def load_last_fingerprint(path: str) -> str:
+    try:
+        if not os.path.exists(path):
+            return ""
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def save_last_fingerprint(path: str, fp: str) -> None:
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(fp or "")
+    except Exception:
+        pass
+
+
 def parse_times_from_html(html: str) -> List[datetime]:
     """
-    Parse the TimeSelection page:
-      - day container: div.date.one-queue
-      - date label: span.header-text
-      - available times: span.available-time
+    Parse the time-selection page for available reservation slots.
+
+    The site uses a day container such as div.date.one-queue and a day heading
+    such as span.header-text. When a slot is available, the day body also contains
+    a time element such as span.available-time.
     """
     soup = BeautifulSoup(html, "lxml")
     out: List[datetime] = []
@@ -99,21 +176,20 @@ def parse_times_from_html(html: str) -> List[datetime]:
         header = day_div.select_one("span.header-text")
         if not header:
             continue
-        day_text = header.get_text(strip=True)
 
-        time_spans = day_div.select("span.available-time")
-        if not time_spans:
-            continue
-
+        day_text = header.get_text(" ", strip=True)
         try:
             day = dtparser.parse(day_text, fuzzy=True).date()
         except Exception:
             continue
 
-        for ts in time_spans:
-            ttxt = ts.get_text(strip=True)
+        time_candidates = day_div.select("span.available-time, a, button, span")
+        for candidate in time_candidates:
+            text = candidate.get_text(" ", strip=True)
+            if not re.search(r"\b\d{1,2}:\d{2}\b", text):
+                continue
             try:
-                dt = dtparser.parse(f"{day.isoformat()} {ttxt}", fuzzy=True)
+                dt = dtparser.parse(f"{day.isoformat()} {text}", fuzzy=True)
                 out.append(dt.replace(second=0, microsecond=0))
             except Exception:
                 continue
@@ -126,6 +202,42 @@ def is_before_cutoff(dt: datetime, cfg: Config) -> bool:
     return dt.date() < cutoff_date(cfg)
 
 
+async def accept_cookies_if_present(page) -> None:
+    try:
+        await page.get_by_role(
+            "button", name=re.compile(r"accept necessary cookies", re.I)
+        ).click(timeout=5000)
+    except Exception:
+        pass
+
+
+async def select_witness_option(page, cfg: Config) -> None:
+    choice_label = (
+        "Yes - we will bring along our own witnesses"
+        if cfg.witness_choice.lower() == "yes"
+        else "No - we will not bring along our own witnesses"
+    )
+    try:
+        await page.get_by_role(
+            "link", name=re.compile(rf"^{re.escape(choice_label)}", re.I)
+        ).first.click(timeout=15000)
+    except Exception:
+        pass
+
+
+async def click_first_available_time(page) -> bool:
+    try:
+        locator = page.locator(
+            "span.available-time, a.available-time, button.available-time"
+        )
+        if await locator.count() == 0:
+            return False
+        await locator.first.click(timeout=15000)
+        return True
+    except Exception:
+        return False
+
+
 async def get_available_slots(cfg: Config) -> List[datetime]:
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=cfg.headless)
@@ -133,102 +245,134 @@ async def get_available_slots(cfg: Config) -> List[datetime]:
         page = await context.new_page()
 
         await page.goto(cfg.home_url, wait_until="domcontentloaded", timeout=30000)
+        await accept_cookies_if_present(page)
+        await select_witness_option(page, cfg)
 
-        # Click the link codegen found.
-        # Use regex "starts with" match to avoid trailing ellipsis differences.
-        link = page.get_by_role(
-            "link",
-            name=re.compile(rf"^{re.escape(cfg.go_to_time_selection_link_prefix)}", re.I),
-        )
-        await link.first.click(timeout=15000)
-
-        # Wait for TimeSelection content
         try:
             await page.wait_for_selector("div.date.one-queue", timeout=20000)
         except PlaywrightTimeoutError:
-            # If this fails, dump the current HTML anyway for debugging.
             html = await page.content()
             await context.close()
             await browser.close()
-            # Try parsing anyway; will likely return []
             return parse_times_from_html(html)
 
         html = await page.content()
         slots = parse_times_from_html(html)
+
+        if cfg.auto_click_first_slot and slots:
+            clicked = await click_first_available_time(page)
+            if clicked:
+                print("Clicked the first discovered available time slot.")
+                print(f"Current page: {page.url}")
 
         await context.close()
         await browser.close()
         return slots
 
 
-async def main_async():
+async def main_async() -> None:
     cfg = Config()
+    cfg.witness_choice = (
+        os.getenv("FRONTDESK_WITNESS_CHOICE", cfg.witness_choice).strip().lower()
+        or cfg.witness_choice
+    )
+    cfg.auto_click_first_slot = (
+        os.getenv("FRONTDESK_AUTO_CLICK_FIRST_SLOT", "").strip().lower()
+        in {"1", "true", "yes"}
+    ) or cfg.auto_click_first_slot
+
+    # Prefer a state directory if provided by the runtime/container.
+    # Check ENV, then conventional mount path, then fallback to current working dir.
+    state_dir = os.getenv("FRONTDESK_STATE_DIR", "")
+    if not state_dir:
+        # common mount point when using the named volume in docker-compose
+        candidate = Path("/usr/src/app/state")
+        if candidate.is_dir():
+            state_dir = str(candidate)
+        else:
+            candidate = Path.cwd() / "state"
+            if candidate.is_dir():
+                state_dir = str(candidate)
+
+    if state_dir:
+        # ensure directory exists
+        try:
+            os.makedirs(state_dir, exist_ok=True)
+        except Exception:
+            pass
+        cfg.seen_file = str(Path(state_dir) / Path(cfg.seen_file).name)
+        cfg.last_fingerprint_file = str(
+            Path(state_dir) / Path(cfg.last_fingerprint_file).name
+        )
+
     seen = load_seen(cfg.seen_file)
     last_telegram_sent_at = 0.0
-    last_fingerprint = ""
+    # load persisted last fingerprint so we notify on changes across restarts
+    last_fingerprint = load_last_fingerprint(cfg.last_fingerprint_file)
 
-
-    print(f"Cutoff: before {cutoff_date(cfg).isoformat()} (year={cfg.cutoff_year})")
-    print(f"Checking every {cfg.interval_seconds}s (+ up to {cfg.jitter_seconds}s jitter).")
+    print(f"Watching: {cfg.home_url}")
+    print(f"Cutoff: before {cutoff_date(cfg).isoformat()}")
+    print(
+        f"Checking every {cfg.interval_seconds}s (+ up to {cfg.jitter_seconds}s jitter)."
+    )
 
     while True:
         try:
             slots = await get_available_slots(cfg)
             good = [s for s in slots if is_before_cutoff(s, cfg)]
             after_cutoff = [s for s in slots if not is_before_cutoff(s, cfg)]
-    
+
             now_str = datetime.now().isoformat(sep=" ", timespec="seconds")
-    
             print(f"\n{now_str} — availability snapshot:")
-            
             print(f"  before cutoff: {len(good)} slot(s)")
             for s in good:
                 print("    ", s.isoformat(sep=" "))
-            
             print(f"  on/after cutoff: {len(after_cutoff)} slot(s)")
-            # --- "new since last run" tracking (optional) ---
+
             newly_found = []
             for s in good:
                 k = s.isoformat()
                 if k not in seen:
                     seen.add(k)
                     newly_found.append(s)
-    
+
             if newly_found:
                 print("  (new since last run)")
                 save_seen(cfg.seen_file, seen)
-    
-            # --- Telegram: notify on changes OR periodic reminder while availability exists ---
+
             fp = slots_fingerprint(good)
             now_ts = time.time()
-    
+
             should_notify_change = bool(good) and (fp != last_fingerprint)
-            should_notify_reminder = bool(good) and (fp == last_fingerprint) and (
-                (now_ts - last_telegram_sent_at) >= cfg.telegram_min_interval_seconds
+            should_notify_reminder = (
+                cfg.telegram_remind_if_still_available
+                and bool(good)
+                and (fp == last_fingerprint)
+                and (
+                    (now_ts - last_telegram_sent_at)
+                    >= cfg.telegram_min_interval_seconds
+                )
             )
-    
+
             if should_notify_change or should_notify_reminder:
-                header = "Slots available (changed):" if should_notify_change else "Slots still available:"
-                lines = [header]
-                lines += [f"- {s.isoformat(sep=' ', timespec='minutes')}" for s in good[: cfg.telegram_max_items]]
-                if len(good) > cfg.telegram_max_items:
-                    lines.append(f"(+{len(good) - cfg.telegram_max_items} more)")
-    
-                telegram_send("\n".join(lines))
-    
+                telegram_send(build_telegram_message(good, cfg.home_url))
                 last_telegram_sent_at = now_ts
                 last_fingerprint = fp
-    
-        except Exception as e:
-            print(f"{datetime.now().isoformat(sep=' ', timespec='seconds')} — error: {e}")
-    
-        await asyncio.sleep(cfg.interval_seconds + random.randint(0, cfg.jitter_seconds))
+                # persist fingerprint so restarts still notice changes
+                save_last_fingerprint(cfg.last_fingerprint_file, fp)
+        except Exception as exc:
+            print(
+                f"{datetime.now().isoformat(sep=' ', timespec='seconds')} — error: {exc}"
+            )
+
+        await asyncio.sleep(
+            cfg.interval_seconds + random.randint(0, cfg.jitter_seconds)
+        )
 
 
-def run():
+def run() -> None:
     asyncio.run(main_async())
 
 
 if __name__ == "__main__":
     run()
-

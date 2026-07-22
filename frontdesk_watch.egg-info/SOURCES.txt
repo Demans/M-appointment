@@ -1,0 +1,8 @@
+frontdesk_watch.py
+pyproject.toml
+frontdesk_watch.egg-info/PKG-INFO
+frontdesk_watch.egg-info/SOURCES.txt
+frontdesk_watch.egg-info/dependency_links.txt
+frontdesk_watch.egg-info/entry_points.txt
+frontdesk_watch.egg-info/requires.txt
+frontdesk_watch.egg-info/top_level.txt
