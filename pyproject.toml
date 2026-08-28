@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "appointment-availability-monitor-demo"
+version = "1.0.0"
+description = "Portfolio-safe demo of HTML availability parsing, state tracking, and deterministic reporting."
+requires-python = ">=3.11"
+authors = [{ name = "Mandeana Mans" }]
+dependencies = []
+
+[project.scripts]
+appointment-monitor-demo = "appointment_monitor.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
